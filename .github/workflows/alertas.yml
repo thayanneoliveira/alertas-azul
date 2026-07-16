@@ -1,0 +1,59 @@
+name: Alertas Azul
+
+on:
+  schedule:
+    - cron: "0 11 * * *"
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alertas-azul
+  cancel-in-progress: false
+
+jobs:
+  monitorar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Restaurar histórico de alertas
+        uses: actions/cache/restore@v4
+        with:
+          path: alert_history.json
+          key: alert-history-${{ github.run_id }}
+          restore-keys: |
+            alert-history-
+
+      - name: Consultar ofertas
+        env:
+          ORIGIN: ${{ vars.ORIGIN }}
+          DESTINATION: ${{ vars.DESTINATION }}
+          YEAR: ${{ vars.YEAR }}
+          MONTH: ${{ vars.MONTH }}
+          MAX_POINTS: ${{ vars.MAX_POINTS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_FROM: ${{ vars.EMAIL_FROM }}
+        run: python src/azul_alert.py
+
+      - name: Salvar histórico de alertas
+        if: always() && hashFiles('alert_history.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: alert_history.json
+          key: alert-history-${{ github.run_id }}
