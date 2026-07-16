@@ -1,6 +1,14 @@
 name: Alertas Azul
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/alertas.yml"
+      - "src/**"
+      - "tests/**"
+      - "requirements.txt"
   schedule:
     - cron: "0 11 * * *"
     - cron: "0 23 * * *"
@@ -46,8 +54,6 @@ jobs:
         env:
           ORIGIN: ${{ vars.ORIGIN }}
           DESTINATION: ${{ vars.DESTINATION }}
-          YEAR: ${{ vars.YEAR }}
-          MONTH: ${{ vars.MONTH }}
           MAX_POINTS: ${{ vars.MAX_POINTS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
