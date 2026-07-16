@@ -33,20 +33,18 @@ HISTORY_FILE = Path("alert_history.json")
 class Config:
     origin: str
     destination: str
-    year: int
-    month: int
     max_points: int
     email_to: str
     resend_api_key: str
     email_from: str
+    year: int | None = None
+    month: int | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
         required = [
             "ORIGIN",
             "DESTINATION",
-            "YEAR",
-            "MONTH",
             "MAX_POINTS",
             "EMAIL_TO",
             "RESEND_API_KEY",
@@ -55,8 +53,13 @@ class Config:
         if missing:
             raise ValueError(f"Variáveis ausentes: {', '.join(missing)}")
 
-        month = int(os.environ["MONTH"])
-        if month < 1 or month > 12:
+        month_raw = os.getenv("MONTH", "").strip()
+        year_raw = os.getenv("YEAR", "").strip()
+
+        month = int(month_raw) if month_raw else None
+        year = int(year_raw) if year_raw else None
+
+        if month is not None and not 1 <= month <= 12:
             raise ValueError("MONTH deve estar entre 1 e 12")
 
         max_points = int(os.environ["MAX_POINTS"])
@@ -66,14 +69,14 @@ class Config:
         return cls(
             origin=os.environ["ORIGIN"].strip().upper(),
             destination=os.environ["DESTINATION"].strip().upper(),
-            year=int(os.environ["YEAR"]),
-            month=month,
             max_points=max_points,
             email_to=os.environ["EMAIL_TO"].strip(),
             resend_api_key=os.environ["RESEND_API_KEY"].strip(),
             email_from=os.getenv(
                 "EMAIL_FROM", "Alertas Azul <onboarding@resend.dev>"
             ).strip(),
+            year=year,
+            month=month,
         )
 
 
@@ -111,11 +114,7 @@ def normalize_points(value: str) -> int:
 
 
 def parse_offers(page_html: str, source_url: str) -> list[FlightOffer]:
-    """Extrai ofertas de cards públicos.
-
-    Os seletores são deliberadamente flexíveis, mas podem precisar de ajuste
-    quando a Azul alterar a estrutura das páginas.
-    """
+    """Extrai ofertas de cards públicos."""
     soup = BeautifulSoup(page_html, "html.parser")
     offers: list[FlightOffer] = []
 
@@ -147,11 +146,11 @@ def parse_offers(page_html: str, source_url: str) -> list[FlightOffer]:
     return offers
 
 
-def parse_offer_date(value: str, target_year: int) -> datetime:
+def parse_offer_date(value: str, fallback_year: int) -> datetime:
     parts = [int(part) for part in value.split("/")]
     if len(parts) == 2:
         day, month = parts
-        year = target_year
+        year = fallback_year
     elif len(parts) == 3:
         day, month, year = parts
         if year < 100:
@@ -163,20 +162,24 @@ def parse_offer_date(value: str, target_year: int) -> datetime:
 
 def filter_offers(offers: Iterable[FlightOffer], config: Config) -> list[FlightOffer]:
     matches: list[FlightOffer] = []
+    current_year = datetime.now().year
+
     for offer in offers:
         try:
-            date = parse_offer_date(offer.date, config.year)
+            date = parse_offer_date(offer.date, config.year or current_year)
         except ValueError:
             continue
 
-        if (
-            offer.origin == config.origin
-            and offer.destination == config.destination
-            and date.year == config.year
-            and date.month == config.month
-            and offer.points <= config.max_points
-        ):
-            matches.append(offer)
+        if offer.origin != config.origin or offer.destination != config.destination:
+            continue
+        if offer.points > config.max_points:
+            continue
+        if config.year is not None and date.year != config.year:
+            continue
+        if config.month is not None and date.month != config.month:
+            continue
+
+        matches.append(offer)
 
     return matches
 
