@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
-import smtplib
-import ssl
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urljoin
@@ -28,6 +25,7 @@ AZUL_VITRINE_URLS = (
     "https://www.voeazul.com.br/pt/ofertas",
 )
 
+RESEND_API_URL = "https://api.resend.com/emails"
 HISTORY_FILE = Path("alert_history.json")
 
 
@@ -39,10 +37,8 @@ class Config:
     month: int
     max_points: int
     email_to: str
-    smtp_server: str
-    smtp_port: int
-    smtp_user: str
-    smtp_password: str
+    resend_api_key: str
+    email_from: str
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -53,26 +49,31 @@ class Config:
             "MONTH",
             "MAX_POINTS",
             "EMAIL_TO",
-            "SMTP_SERVER",
-            "SMTP_PORT",
-            "SMTP_USER",
-            "SMTP_PASSWORD",
+            "RESEND_API_KEY",
         ]
         missing = [name for name in required if not os.getenv(name)]
         if missing:
             raise ValueError(f"Variáveis ausentes: {', '.join(missing)}")
 
+        month = int(os.environ["MONTH"])
+        if month < 1 or month > 12:
+            raise ValueError("MONTH deve estar entre 1 e 12")
+
+        max_points = int(os.environ["MAX_POINTS"])
+        if max_points <= 0:
+            raise ValueError("MAX_POINTS deve ser maior que zero")
+
         return cls(
-            origin=os.environ["ORIGIN"].upper(),
-            destination=os.environ["DESTINATION"].upper(),
+            origin=os.environ["ORIGIN"].strip().upper(),
+            destination=os.environ["DESTINATION"].strip().upper(),
             year=int(os.environ["YEAR"]),
-            month=int(os.environ["MONTH"]),
-            max_points=int(os.environ["MAX_POINTS"]),
-            email_to=os.environ["EMAIL_TO"],
-            smtp_server=os.environ["SMTP_SERVER"],
-            smtp_port=int(os.environ["SMTP_PORT"]),
-            smtp_user=os.environ["SMTP_USER"],
-            smtp_password=os.environ["SMTP_PASSWORD"],
+            month=month,
+            max_points=max_points,
+            email_to=os.environ["EMAIL_TO"].strip(),
+            resend_api_key=os.environ["RESEND_API_KEY"].strip(),
+            email_from=os.getenv(
+                "EMAIL_FROM", "Alertas Azul <onboarding@resend.dev>"
+            ).strip(),
         )
 
 
@@ -109,13 +110,13 @@ def normalize_points(value: str) -> int:
     return int(digits)
 
 
-def parse_offers(html: str, source_url: str) -> list[FlightOffer]:
+def parse_offers(page_html: str, source_url: str) -> list[FlightOffer]:
     """Extrai ofertas de cards públicos.
 
-    Os seletores abaixo são deliberadamente flexíveis, mas podem precisar de
-    ajuste se a Azul alterar o HTML da página.
+    Os seletores são deliberadamente flexíveis, mas podem precisar de ajuste
+    quando a Azul alterar a estrutura das páginas.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(page_html, "html.parser")
     offers: list[FlightOffer] = []
 
     candidate_cards = soup.select(
@@ -202,30 +203,36 @@ def send_email(config: Config, offers: list[FlightOffer]) -> None:
     ).replace(",", ".")
 
     rows = "".join(
-        f"<li><strong>{offer.date}</strong> — {offer.origin} → "
-        f"{offer.destination}: <strong>{offer.points:,} pontos</strong> "
-        f"(<a href='{offer.url}'>ver oferta</a>)</li>".replace(",", ".")
+        "<li>"
+        f"<strong>{html.escape(offer.date)}</strong> — "
+        f"{html.escape(offer.origin)} → {html.escape(offer.destination)}: "
+        f"<strong>{offer.points:,} pontos</strong> "
+        f"(<a href='{html.escape(offer.url, quote=True)}'>ver oferta</a>)"
+        "</li>".replace(",", ".")
         for offer in offers
     )
 
     body = f"""
     <h2>Encontramos uma possível oportunidade</h2>
     <ul>{rows}</ul>
-    <p>Confirme o preço, taxas e disponibilidade no site ou app oficial da Azul antes de emitir.</p>
+    <p>Confirme o preço, as taxas e a disponibilidade no site ou app oficial da Azul antes de emitir.</p>
     """
 
-    message = MIMEMultipart("alternative")
-    message["From"] = config.smtp_user
-    message["To"] = config.email_to
-    message["Subject"] = subject
-    message.attach(MIMEText(body, "html", "utf-8"))
-
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(
-        config.smtp_server, config.smtp_port, context=context
-    ) as server:
-        server.login(config.smtp_user, config.smtp_password)
-        server.sendmail(config.smtp_user, [config.email_to], message.as_string())
+    response = requests.post(
+        RESEND_API_URL,
+        headers={
+            "Authorization": f"Bearer {config.resend_api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": config.email_from,
+            "to": [config.email_to],
+            "subject": subject,
+            "html": body,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
 
 
 def main() -> int:
@@ -250,7 +257,12 @@ def main() -> int:
         print("Nenhuma oferta nova encontrada dentro dos critérios.")
         return 0
 
-    send_email(config, new_matches)
+    try:
+        send_email(config, new_matches)
+    except requests.RequestException as exc:
+        print(f"Falha ao enviar e-mail pelo Resend: {exc}", file=sys.stderr)
+        return 1
+
     history.update(offer.key for offer in new_matches)
     save_history(history)
     print(f"Alerta enviado para {len(new_matches)} oferta(s).")
