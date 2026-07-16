@@ -4,7 +4,7 @@ Projeto pessoal para monitorar ofertas públicas de passagens da Azul em pontos 
 
 ## Objetivo
 
-Permitir o cadastro de uma regra como:
+Permitir uma regra como:
 
 - origem: CNF;
 - destino: SLZ;
@@ -21,25 +21,46 @@ Quando uma oferta pública compatível for encontrada, o sistema envia um e-mail
 - exige validação manual no site ou aplicativo oficial;
 - os seletores HTML podem precisar de ajuste caso a Azul altere a estrutura das páginas.
 
-## Instalação
+## Configuração no GitHub
+
+Em `Settings > Secrets and variables > Actions`, crie:
+
+### Secrets
+
+- `RESEND_API_KEY`: chave da API do Resend;
+- `EMAIL_TO`: endereço que receberá os alertas.
+
+### Variables
+
+- `ORIGIN`: `CNF`;
+- `DESTINATION`: `SLZ`;
+- `YEAR`: `2026`;
+- `MONTH`: `9`;
+- `MAX_POINTS`: `6000`;
+- `EMAIL_FROM`: `Alertas Azul <onboarding@resend.dev>`.
+
+No modo de testes do Resend, o destinatário normalmente precisa ser o mesmo e-mail cadastrado na conta. Para enviar a outros endereços, configure um domínio verificado no Resend.
+
+## Execução automática
+
+O workflow `.github/workflows/alertas.yml` executa o monitor aproximadamente às 08h e às 20h no horário de Brasília. O GitHub pode atrasar execuções agendadas em períodos de maior carga.
+
+Também é possível executar manualmente em:
+
+`Actions > Alertas Azul > Run workflow`.
+
+O histórico de ofertas já enviadas é mantido por cache para reduzir alertas duplicados.
+
+## Execução local
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-```
-
-Preencha o arquivo `.env` e execute:
-
-```bash
 python src/azul_alert.py
 ```
 
-## Agendamento
-
-Para uso pessoal, execute uma ou duas vezes por dia com cron, Agendador de Tarefas do Windows ou GitHub Actions.
-
 ## Segurança
 
-Nunca salve senha de e-mail diretamente no código. Use variáveis de ambiente e, no Gmail, uma senha de aplicativo.
+O sistema não precisa da senha do Gmail. O envio é feito pela API do Resend e a chave deve permanecer apenas nos Secrets do GitHub.
