@@ -55,8 +55,10 @@ jobs:
           ORIGIN: ${{ vars.ORIGIN }}
           DESTINATION: ${{ vars.DESTINATION }}
           MAX_POINTS: ${{ vars.MAX_POINTS }}
+          SEARCH_DAYS: ${{ vars.SEARCH_DAYS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          SEATS_AERO_API_KEY: ${{ secrets.SEATS_AERO_API_KEY }}
           EMAIL_FROM: ${{ vars.EMAIL_FROM }}
         run: python src/azul_alert.py
 
