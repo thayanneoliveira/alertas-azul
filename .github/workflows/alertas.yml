@@ -24,7 +24,7 @@ concurrency:
 jobs:
   monitorar:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Baixar repositório
@@ -37,7 +37,9 @@ jobs:
           cache: pip
 
       - name: Instalar dependências
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
 
       - name: Executar testes
         run: pytest -q
@@ -55,12 +57,18 @@ jobs:
           ORIGIN: ${{ vars.ORIGIN }}
           DESTINATION: ${{ vars.DESTINATION }}
           MAX_POINTS: ${{ vars.MAX_POINTS }}
-          SEARCH_DAYS: ${{ vars.SEARCH_DAYS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          SEATS_AERO_API_KEY: ${{ secrets.SEATS_AERO_API_KEY }}
           EMAIL_FROM: ${{ vars.EMAIL_FROM }}
         run: python src/azul_alert.py
+
+      - name: Publicar evidências da consulta
+        if: always() && hashFiles('artifacts/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidencias-azul-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 7
 
       - name: Salvar histórico de alertas
         if: always() && hashFiles('alert_history.json') != ''
