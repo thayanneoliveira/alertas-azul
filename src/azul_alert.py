@@ -1,24 +1,31 @@
-"""Monitor pessoal de passagens Azul por pontos usando a API do Seats.aero."""
+"""Monitor pessoal de passagens Azul por pontos com Playwright.
+
+O robô abre a página pública de ofertas em pontos da Azul, aplica origem,
+destino e orçamento máximo e extrai os cards renderizados no navegador.
+Não realiza login, reserva ou emissão automática.
+"""
 
 from __future__ import annotations
 
 import html
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
-from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 import requests
 from dotenv import load_dotenv
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 load_dotenv()
 
-SEATS_AERO_SEARCH_URL = "https://seats.aero/partnerapi/search"
+AZUL_POINTS_URL = "https://passagens.voeazul.com.br/pt/pontos"
 RESEND_API_URL = "https://api.resend.com/emails"
 HISTORY_FILE = Path("alert_history.json")
+ARTIFACT_DIR = Path("artifacts")
 
 
 @dataclass(frozen=True)
@@ -26,44 +33,30 @@ class Config:
     origin: str
     destination: str
     max_points: int
-    search_days: int
     email_to: str
     email_from: str
     resend_api_key: str
-    seats_aero_api_key: str
 
     @classmethod
     def from_env(cls) -> "Config":
-        required = (
-            "ORIGIN",
-            "DESTINATION",
-            "MAX_POINTS",
-            "EMAIL_TO",
-            "RESEND_API_KEY",
-            "SEATS_AERO_API_KEY",
-        )
+        required = ("ORIGIN", "DESTINATION", "MAX_POINTS", "EMAIL_TO", "RESEND_API_KEY")
         missing = [name for name in required if not os.getenv(name)]
         if missing:
             raise ValueError(f"Variáveis ausentes: {', '.join(missing)}")
 
         max_points = int(os.environ["MAX_POINTS"])
-        search_days = int(os.getenv("SEARCH_DAYS", "365"))
         if max_points <= 0:
             raise ValueError("MAX_POINTS deve ser maior que zero")
-        if not 1 <= search_days <= 365:
-            raise ValueError("SEARCH_DAYS deve estar entre 1 e 365")
 
         return cls(
             origin=os.environ["ORIGIN"].strip().upper(),
             destination=os.environ["DESTINATION"].strip().upper(),
             max_points=max_points,
-            search_days=search_days,
             email_to=os.environ["EMAIL_TO"].strip(),
             email_from=os.getenv(
                 "EMAIL_FROM", "Alertas Azul <onboarding@resend.dev>"
             ).strip(),
             resend_api_key=os.environ["RESEND_API_KEY"].strip(),
-            seats_aero_api_key=os.environ["SEATS_AERO_API_KEY"].strip(),
         )
 
 
@@ -73,163 +66,158 @@ class FlightOffer:
     origin: str
     destination: str
     points: int
-    direct: bool
-    airlines: str
-    source: str
+    trip_type: str
+    url: str
 
     @property
     def key(self) -> str:
         return (
             f"{self.departure_date}|{self.origin}|{self.destination}|"
-            f"{self.points}|{self.direct}|{self.airlines}|{self.source}"
+            f"{self.points}|{self.trip_type}"
         )
 
 
-def _first(mapping: dict[str, Any], *names: str) -> Any:
-    for name in names:
-        if name in mapping and mapping[name] not in (None, ""):
-            return mapping[name]
-    return None
+def normalize_points(value: str) -> int:
+    digits = re.sub(r"\D", "", value)
+    if not digits:
+        raise ValueError("Pontuação inválida")
+    return int(digits)
 
 
-def _to_int(value: Any) -> int | None:
-    if value in (None, ""):
-        return None
-    try:
-        return int(float(str(value).replace(",", "")))
-    except (TypeError, ValueError):
-        return None
+def _fill_search_field(page: Page, index: int, value: str) -> None:
+    inputs = page.get_by_placeholder("Digitar origem")
+    if index == 1:
+        inputs = page.get_by_placeholder("Digitar destino")
+
+    locator = inputs.first
+    locator.wait_for(state="visible", timeout=20_000)
+    locator.click()
+    locator.fill(value)
+    page.wait_for_timeout(1_500)
+    locator.press("ArrowDown")
+    locator.press("Enter")
 
 
-def _iter_availability_objects(payload: Any) -> Iterable[dict[str, Any]]:
-    """Aceita pequenas variações no envelope JSON da API."""
-    if isinstance(payload, list):
-        for item in payload:
-            if isinstance(item, dict):
-                yield item
-        return
-
-    if not isinstance(payload, dict):
-        return
-
-    for key in ("data", "availability", "availabilities", "results"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    yield item
-            return
-
-    # Em último caso, considera o próprio objeto uma disponibilidade.
-    yield payload
+def _fill_budget(page: Page, max_points: int) -> None:
+    budget = page.get_by_placeholder("Digite o orçamento máximo").first
+    budget.wait_for(state="visible", timeout=20_000)
+    budget.fill(str(max_points))
+    budget.press("Enter")
 
 
-def parse_seats_aero_offers(payload: Any) -> list[FlightOffer]:
+def _apply_filters(page: Page, config: Config) -> None:
+    _fill_search_field(page, 0, config.origin)
+    _fill_search_field(page, 1, config.destination)
+    _fill_budget(page, config.max_points)
+
+    # Algumas versões da página aplicam filtros automaticamente; outras expõem
+    # um botão de busca. O clique é tentado sem tornar o fluxo dependente dele.
+    for label in ("Buscar", "Pesquisar", "Aplicar filtros"):
+        button = page.get_by_role("button", name=re.compile(label, re.I))
+        if button.count() and button.first.is_visible():
+            button.first.click()
+            break
+
+    page.wait_for_timeout(6_000)
+
+
+def parse_rendered_offers(text: str, config: Config) -> list[FlightOffer]:
+    """Extrai cards da vitrine pública a partir do texto renderizado.
+
+    A página costuma apresentar blocos como:
+    "Belo Horizonte (CNF) Para São Luís (SLZ) Ida: 14/09/2026
+    A partir de 5.800 pontos Só ida".
+    """
+    compact = re.sub(r"\s+", " ", text)
+    pattern = re.compile(
+        r"(?P<origin_name>.{0,80}?)\((?P<origin>[A-Z]{3})\)\s*Para\s*"
+        r"(?P<destination_name>.{0,80}?)\((?P<destination>[A-Z]{3})\)\s*"
+        r"(?:Ida|Partida):\s*(?P<date>\d{1,2}/\d{1,2}/\d{4}).{0,120}?"
+        r"A partir de\s*(?P<points>[\d\.,]+)\s*pontos?.{0,80}?"
+        r"(?P<trip>Só ida|Ida e volta)",
+        re.IGNORECASE,
+    )
+
     offers: list[FlightOffer] = []
-
-    for item in _iter_availability_objects(payload):
-        route = item.get("Route") or item.get("route") or {}
-        if not isinstance(route, dict):
-            route = {}
-
-        origin = _first(
-            item, "OriginAirport", "origin_airport", "originAirport", "origin"
-        ) or _first(route, "OriginAirport", "origin_airport", "originAirport", "origin")
-        destination = _first(
-            item,
-            "DestinationAirport",
-            "destination_airport",
-            "destinationAirport",
-            "destination",
-        ) or _first(
-            route,
-            "DestinationAirport",
-            "destination_airport",
-            "destinationAirport",
-            "destination",
-        )
-        departure_date = _first(item, "Date", "date", "departure_date", "departureDate")
-        points = _to_int(
-            _first(
-                item,
-                "YMileageCost",
-                "y_mileage_cost",
-                "economy_mileage_cost",
-                "economyMileageCost",
-            )
-        )
-        available = _first(item, "YAvailable", "y_available", "economy_available")
-        direct = bool(_first(item, "YDirect", "y_direct", "economy_direct") or False)
-        airlines = str(
-            _first(item, "YAirlines", "y_airlines", "economy_airlines") or "Azul"
-        )
-        source = str(_first(item, "Source", "source") or _first(route, "Source", "source") or "azul")
-
-        if available is False:
+    for match in pattern.finditer(compact):
+        origin = match.group("origin").upper()
+        destination = match.group("destination").upper()
+        points = normalize_points(match.group("points"))
+        if origin != config.origin or destination != config.destination:
             continue
-        if not origin or not destination or not departure_date or points is None:
+        if points > config.max_points:
             continue
-
         offers.append(
             FlightOffer(
-                departure_date=str(departure_date)[:10],
-                origin=str(origin).upper(),
-                destination=str(destination).upper(),
+                departure_date=match.group("date"),
+                origin=origin,
+                destination=destination,
                 points=points,
-                direct=direct,
-                airlines=airlines,
-                source=source,
+                trip_type=match.group("trip"),
+                url=AZUL_POINTS_URL,
             )
         )
 
-    return offers
+    return sorted(offers, key=lambda item: (item.points, item.departure_date))
 
 
 def fetch_offers(config: Config) -> list[FlightOffer]:
-    start = date.today()
-    end = start + timedelta(days=config.search_days)
+    ARTIFACT_DIR.mkdir(exist_ok=True)
 
-    response = requests.get(
-        SEATS_AERO_SEARCH_URL,
-        headers={
-            "Partner-Authorization": config.seats_aero_api_key,
-            "Accept": "application/json",
-            "User-Agent": "alertas-azul/1.0",
-        },
-        params={
-            "origin_airport": config.origin,
-            "destination_airport": config.destination,
-            "start_date": start.isoformat(),
-            "end_date": end.isoformat(),
-            "sources": "azul",
-            "cabins": "economy",
-            "order_by": "lowest_mileage",
-            "take": 1000,
-            "include_filtered": "true",
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    offers = parse_seats_aero_offers(payload)
-    print(
-        f"Seats.aero consultado: {config.origin} → {config.destination}, "
-        f"{start.isoformat()} até {end.isoformat()}. Ofertas extraídas: {len(offers)}."
-    )
-    return offers
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
+            viewport={"width": 1440, "height": 1200},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
 
+        try:
+            response = page.goto(AZUL_POINTS_URL, wait_until="domcontentloaded", timeout=60_000)
+            if response is not None and response.status >= 400:
+                raise RuntimeError(f"Azul respondeu HTTP {response.status}")
 
-def filter_offers(offers: Iterable[FlightOffer], config: Config) -> list[FlightOffer]:
-    return sorted(
-        (
-            offer
-            for offer in offers
-            if offer.origin == config.origin
-            and offer.destination == config.destination
-            and offer.points <= config.max_points
-        ),
-        key=lambda offer: (offer.points, offer.departure_date),
-    )
+            page.wait_for_timeout(5_000)
+            body_before = page.locator("body").inner_text(timeout=20_000)
+            blocked_markers = ("Access denied", "Forbidden", "Verifique se você é humano")
+            if any(marker.lower() in body_before.lower() for marker in blocked_markers):
+                raise RuntimeError("A proteção do site bloqueou o navegador automatizado")
+
+            _apply_filters(page, config)
+            rendered_text = page.locator("body").inner_text(timeout=20_000)
+            page.screenshot(path=str(ARTIFACT_DIR / "azul-resultados.png"), full_page=True)
+            (ARTIFACT_DIR / "azul-resultados.txt").write_text(
+                rendered_text, encoding="utf-8"
+            )
+
+            offers = parse_rendered_offers(rendered_text, config)
+            print(
+                f"Página Azul consultada com navegador. "
+                f"Rota {config.origin} → {config.destination}. "
+                f"Ofertas até {config.max_points} pontos: {len(offers)}."
+            )
+            return offers
+        except Exception:
+            try:
+                page.screenshot(path=str(ARTIFACT_DIR / "azul-erro.png"), full_page=True)
+                (ARTIFACT_DIR / "azul-erro.txt").write_text(
+                    page.locator("body").inner_text(timeout=5_000), encoding="utf-8"
+                )
+            except Exception:
+                pass
+            raise
+        finally:
+            context.close()
+            browser.close()
 
 
 def load_history() -> set[str]:
@@ -256,9 +244,10 @@ def send_email(config: Config, offers: list[FlightOffer]) -> None:
     rows = "".join(
         "<li>"
         f"<strong>{html.escape(offer.departure_date)}</strong> — "
-        f"{html.escape(offer.origin)} → {html.escape(offer.destination)}: "
-        f"<strong>{offer.points:,} pontos</strong>"
-        f"{' — direto' if offer.direct else ''}"
+        f"{offer.origin} → {offer.destination}: "
+        f"<strong>{offer.points:,} pontos</strong> — "
+        f"{html.escape(offer.trip_type)} "
+        f"(<a href='{html.escape(offer.url)}'>abrir Azul</a>)"
         "</li>".replace(",", ".")
         for offer in offers
     )
@@ -266,8 +255,7 @@ def send_email(config: Config, offers: list[FlightOffer]) -> None:
     body = f"""
     <h2>Encontramos uma possível oportunidade</h2>
     <ul>{rows}</ul>
-    <p>Fonte de disponibilidade: Seats.aero / Azul Fidelidade.</p>
-    <p>Confirme o valor, as taxas e a disponibilidade no site ou app oficial da Azul antes de emitir.</p>
+    <p>Confirme o preço, as taxas e a disponibilidade no site ou app oficial da Azul antes de emitir.</p>
     """
 
     response = requests.post(
@@ -296,23 +284,15 @@ def main() -> int:
 
     try:
         offers = fetch_offers(config)
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "desconhecido"
-        body = exc.response.text[:500] if exc.response is not None else ""
-        print(
-            f"Falha na API Seats.aero (HTTP {status}). {body}",
-            file=sys.stderr,
-        )
+    except (RuntimeError, PlaywrightTimeoutError) as exc:
+        print(f"Falha ao consultar a Azul pelo navegador: {exc}", file=sys.stderr)
         return 1
-    except (requests.RequestException, ValueError) as exc:
-        print(f"Falha ao consultar a API Seats.aero: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Erro inesperado ao consultar a Azul: {exc}", file=sys.stderr)
         return 1
-
-    matches = filter_offers(offers, config)
-    print(f"Ofertas dentro do limite de {config.max_points} pontos: {len(matches)}.")
 
     history = load_history()
-    new_matches = [offer for offer in matches if offer.key not in history]
+    new_matches = [offer for offer in offers if offer.key not in history]
 
     if not new_matches:
         print("Nenhuma oferta nova encontrada dentro dos critérios.")
